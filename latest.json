@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
-  "version": "0.3.0.2",
-  "sourceCommit": "24b327b21ffbf916972fc7a71c9116f62a4e6342",
-  "publishedAt": "2026-08-08T04:40:37Z",
+  "version": "0.3.0.3",
+  "sourceCommit": "362688d2d394efcc3dcefd9ca5f63116284ba657",
+  "publishedAt": "2026-08-08T04:51:59Z",
   "userscriptUrl": "https://echoxiaoze.github.io/bilibili-guard-extension-dist/userscript/bilibili-guard.user.js",
   "extensionUrl": "https://echoxiaoze.github.io/bilibili-guard-extension-dist/extension/bilibili-guard-extension.zip",
   "sha256": {
-    "userscript": "5421e9f2b0c3200dab16553f63b10851afa32fcf2f8f6a42b8a1812822854d5a",
-    "extension": "becde6d56edf471412b10eb20bbde81a6910059b1bde3a56a6403eff2cdcac7d"
+    "userscript": "f5f4f0a01603b1216a0825fc60959d549bf0af0df938ecd0e5959f78ae4df8b1",
+    "extension": "6257823a5800f0107f4c731cfb10be7f9ee4f290f4cffe06d7853b5ae1cda3d6"
   }
 }
