@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站大航海详情
 // @namespace    https://github.com/EchoXiaoze/bilibili-guard-extension
-// @version      0.3.1.7
+// @version      0.3.1.8
 // @description  在B站视频页和个人空间按需显示当前创作者的大航海详情。
 // @match        https://www.bilibili.com/video/*
 // @match        https://space.bilibili.com/*
