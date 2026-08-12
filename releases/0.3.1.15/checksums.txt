@@ -1,0 +1,2 @@
+35201f61bc36f208cefc2dd2b939277f36df57f1aec8e04bc26fd29aa38b3534  bilibili-guard-extension.zip
+7768cc6501404faac4888efd6263584752adfe5488146902a6363af8d7ead05e  bilibili-guard.user.js
