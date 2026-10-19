@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站大航海详情
 // @namespace    https://github.com/EchoXiaoze/bilibili-guard-extension
-// @version      0.3.1.30
+// @version      0.3.1.31
 // @description  在B站视频页和个人空间按需显示当前创作者的大航海详情。
 // @match        https://www.bilibili.com/video/*
 // @match        https://space.bilibili.com/*
@@ -62,6 +62,9 @@
     'guard.details.get',
     'guard.refresh',
     'guard.stream-revenue.retry',
+    'guard.more.flow.get',
+    'guard.more.fans-rank.get',
+    'guard.more.recent-live.get',
   ]);
   const MAX_SAFE_ID = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -178,6 +181,9 @@
     if (message.type === 'guard.stream-revenue.retry' && message.force !== true) {
       throw createError('invalid_identity');
     }
+    if (message.type.startsWith('guard.more.') && message.force !== false) {
+      throw createError('invalid_identity');
+    }
 
     const normalized = {
       type: message.type,
@@ -187,6 +193,11 @@
       force: message.force,
     };
     if (message.type === 'guard.refresh') normalized.detailsOpen = message.detailsOpen;
+    if (message.type === 'guard.more.recent-live.get') {
+      const roomId = normalizeUid(message.roomId);
+      if (!roomId) throw createError('invalid_identity');
+      normalized.roomId = roomId;
+    }
     return normalized;
   }
 
@@ -553,6 +564,10 @@
     guard: 'https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList',
     ipLocation: 'https://api.gscn.live/bw/api/public/bilibili/ip-location',
     streamRevenue: 'https://api.vtb.cat/liver/space',
+    liverFlow: 'https://api.vtb.cat/liver/flow',
+    fansRank: 'https://api.vtb.cat/fansRank',
+    actions: 'https://api.vtb.cat/actions',
+    liveOnline: 'https://api.vtb.cat/online',
     liverGuild: 'https://fetch.danmakus.com/https://workers.vrp.moe/laplace/bilibili-user/',
   });
   const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -561,6 +576,14 @@
   const MAX_STREAM_REVENUE_BODY_BYTES = 2 * 1024 * 1024;
   const STREAM_REVENUE_TIMEOUT_MS = 4000;
   const MAX_STREAM_REVENUE = 100_000_000;
+  const MAX_VTB_AUX_BODY_BYTES = 512 * 1024;
+  const VTB_AUX_TIMEOUT_MS = 4000;
+  const MAX_MONTHLY_TOTAL = 300_000_000;
+  const MAX_FANS_RANK_GROUPS = 8;
+  const MAX_ONLINE_POINTS = 5000;
+  const MAX_ONLINE_SERIES_POINTS = 120;
+  const MIN_LIVE_TIMESTAMP = 1_200_000_000;
+  const MAX_LIVE_TIMESTAMP = 4_200_000_000;
   const MAX_LIVER_GUILD_BODY_BYTES = 64 * 1024;
   const LIVER_GUILD_TIMEOUT_MS = 4000;
   const IP_LOCATION_STATUSES = new Set([
@@ -597,6 +620,133 @@
     return Number.isFinite(number) && number >= 0 && number <= MAX_STREAM_REVENUE
       ? number
       : null;
+  }
+
+  function nonNegativeInteger(value, maximum = MAX_STREAM_REVENUE) {
+    const number = typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^\d+$/u.test(value.trim())
+        ? Number(value)
+        : NaN;
+    return Number.isInteger(number) && number >= 0 && number <= maximum ? number : null;
+  }
+
+  function boundedVtbText(value) {
+    if (typeof value !== 'string' || /[<>]/u.test(value)) return '';
+    const text = value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim();
+    return text.slice(0, 40);
+  }
+
+  function normalizeLiverFlowPayload(payload) {
+    const unavailable = {status: 'unavailable', months: []};
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return unavailable;
+    const rows = payload.data;
+    if (rows === null || rows === undefined) return {status: 'no_data', months: []};
+    if (!Array.isArray(rows) || rows.length > 36) return unavailable;
+    if (rows.length === 0) return {status: 'no_data', months: []};
+    const months = [];
+    for (const row of rows) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return unavailable;
+      const year = normalizePositiveInteger(row.Year);
+      const month = normalizePositiveInteger(row.Month);
+      const giftSc = nonNegativeRevenue(row.Live);
+      const guard = nonNegativeRevenue(row.GuardSum);
+      const charge = nonNegativeRevenue(row.Charge);
+      if (!year || year < 2018 || year > 2100 || !month || month > 12) return unavailable;
+      if (giftSc === null || guard === null || charge === null) return unavailable;
+      const total = giftSc + guard + charge;
+      if (!Number.isFinite(total) || total > MAX_MONTHLY_TOTAL) return unavailable;
+      months.push({year, month, giftSc, guard, charge, total});
+    }
+    months.sort((left, right) => left.year - right.year || left.month - right.month);
+    return {status: 'found', months};
+  }
+
+  function normalizeFansRankPayload(payload, uidValue) {
+    const uid = normalizeUid(uidValue);
+    const unavailable = {status: 'unavailable', alive: null, groups: []};
+    if (!uid || !payload || typeof payload !== 'object' || Array.isArray(payload)) return unavailable;
+    const alive = nonNegativeInteger(payload.alive);
+    if (alive === null) return unavailable;
+    const rows = payload.group;
+    if (rows === null || rows === undefined) return {status: 'no_data', alive: 0, groups: []};
+    if (!Array.isArray(rows) || rows.length > 200) return unavailable;
+    const groups = [];
+    for (const row of rows.slice(0, MAX_FANS_RANK_GROUPS)) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return unavailable;
+      const count = nonNegativeInteger(row.cnt);
+      const name = boundedVtbText(row.liver);
+      const medal = boundedVtbText(row.medal_name);
+      const liverId = normalizeUid(row.liver_id);
+      if (count === null || !name) return unavailable;
+      groups.push({name, medal, count, self: liverId === uid});
+    }
+    if (alive === 0 || groups.length === 0) return {status: 'no_data', alive: 0, groups: []};
+    return {status: 'found', alive, groups};
+  }
+
+  function downsampleSeries(values) {
+    if (values.length <= MAX_ONLINE_SERIES_POINTS) return values;
+    const stride = values.length / MAX_ONLINE_SERIES_POINTS;
+    const sampled = [];
+    for (let index = 0; index < MAX_ONLINE_SERIES_POINTS; index += 1) {
+      sampled.push(values[Math.floor(index * stride)]);
+    }
+    return sampled;
+  }
+
+  function normalizeOnlinePayload(payload) {
+    const rows = payload?.data;
+    if (!Array.isArray(rows) || rows.length > MAX_ONLINE_POINTS) return null;
+    const values = [];
+    for (const row of rows) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+      const count = nonNegativeInteger(row.Count);
+      if (count === null) continue;
+      values.push(count);
+    }
+    if (values.length === 0) return null;
+    return {peak: Math.max(...values), series: downsampleSeries(values)};
+  }
+
+  function normalizeLiveTimestamp(value) {
+    const number = normalizePositiveInteger(value);
+    if (!number || number < MIN_LIVE_TIMESTAMP || number > MAX_LIVE_TIMESTAMP) return null;
+    return number;
+  }
+
+  function emptyRecentLive(status) {
+    return {status, liveId: null, endedAt: null, messages: null, revenue: null};
+  }
+
+  function normalizeRecentLiveActions(payload, uidValue, roomValue) {
+    const uid = normalizeUid(uidValue);
+    const roomId = normalizeUid(roomValue);
+    if (!uid || !roomId || !payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return emptyRecentLive('unavailable');
+    }
+    const lives = payload.lives;
+    if (lives === null || lives === undefined) return emptyRecentLive('no_data');
+    if (!Array.isArray(lives) || lives.length > 100) return emptyRecentLive('unavailable');
+    const live = lives.find(item => (
+      item
+      && typeof item === 'object'
+      && !Array.isArray(item)
+      && normalizeUid(item.user_id_num) === uid
+      && normalizeUid(item.room_id) === roomId
+    ));
+    if (!live) return emptyRecentLive('no_data');
+    const liveId = normalizeUid(live.id);
+    const messages = nonNegativeInteger(live.message);
+    const revenue = nonNegativeRevenue(live.money);
+    if (!liveId || messages === null || revenue === null) return emptyRecentLive('unavailable');
+    return {
+      status: 'found',
+      liveId,
+      endedAt: normalizeLiveTimestamp(live.end_at),
+      messages,
+      revenue,
+    };
   }
 
   function parseCharge(value) {
@@ -950,6 +1100,105 @@
       }
     }
 
+    async function requestVtbJson(url) {
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        Math.min(timeoutMs, VTB_AUX_TIMEOUT_MS),
+      );
+      try {
+        const response = await fetchImpl(url.href, {
+          method: 'GET',
+          credentials: 'omit',
+          redirect: 'error',
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        if (!response?.ok) throw createError('guard_lookup_failed');
+        const contentLength = response.headers?.get?.('content-length');
+        if (contentLength !== null && contentLength !== undefined) {
+          const size = Number(contentLength);
+          if (!Number.isFinite(size) || size < 0 || size > MAX_VTB_AUX_BODY_BYTES) {
+            throw createError('guard_lookup_failed');
+          }
+        }
+        const text = await response.text();
+        if (typeof text !== 'string' || text.length > MAX_VTB_AUX_BODY_BYTES) {
+          throw createError('guard_lookup_failed');
+        }
+        const payload = JSON.parse(text);
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+          throw createError('guard_lookup_failed');
+        }
+        return payload;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    async function fetchLiverFlow(uidValue) {
+      const unavailable = Object.freeze({status: 'unavailable', months: []});
+      const uid = normalizeUid(uidValue);
+      if (!uid) return unavailable;
+      const url = new URL(ENDPOINTS.liverFlow);
+      url.searchParams.set('uid', uid);
+      try {
+        return Object.freeze(normalizeLiverFlowPayload(await requestVtbJson(url)));
+      } catch {
+        return unavailable;
+      }
+    }
+
+    async function fetchFansRank(uidValue) {
+      const unavailable = Object.freeze({status: 'unavailable', alive: null, groups: []});
+      const uid = normalizeUid(uidValue);
+      if (!uid) return unavailable;
+      const url = new URL(ENDPOINTS.fansRank);
+      url.searchParams.set('liver', uid);
+      try {
+        return Object.freeze(normalizeFansRankPayload(await requestVtbJson(url), uid));
+      } catch {
+        return unavailable;
+      }
+    }
+
+    async function fetchRecentLive(uidValue, roomValue) {
+      const unavailable = Object.freeze({
+        ...emptyRecentLive('unavailable'), peakOnline: null, series: [],
+      });
+      const uid = normalizeUid(uidValue);
+      const roomId = normalizeUid(roomValue);
+      if (!uid || !roomId) return unavailable;
+      const actionsUrl = new URL(ENDPOINTS.actions);
+      actionsUrl.searchParams.set('uid', uid);
+      actionsUrl.searchParams.set('room', roomId);
+      actionsUrl.searchParams.set('pn', '1');
+      actionsUrl.searchParams.set('ps', '1');
+      actionsUrl.searchParams.set('order', 'time_desc');
+      let base;
+      try {
+        base = normalizeRecentLiveActions(await requestVtbJson(actionsUrl), uid, roomId);
+      } catch {
+        return unavailable;
+      }
+      if (base.status !== 'found') {
+        return Object.freeze({...base, peakOnline: null, series: []});
+      }
+      let online = null;
+      try {
+        const onlineUrl = new URL(ENDPOINTS.liveOnline);
+        onlineUrl.searchParams.set('id', base.liveId);
+        online = normalizeOnlinePayload(await requestVtbJson(onlineUrl));
+      } catch {
+        online = null;
+      }
+      return Object.freeze({
+        ...base,
+        peakOnline: online ? online.peak : null,
+        series: online ? online.series : [],
+      });
+    }
+
     return Object.freeze({
       resolveVideo,
       resolveRoom,
@@ -957,6 +1206,9 @@
       fetchIpLocation,
       fetchStreamRevenue,
       fetchLiverGuild,
+      fetchLiverFlow,
+      fetchFansRank,
+      fetchRecentLive,
     });
   }
 
@@ -977,6 +1229,8 @@
   const DETAILS_TTL_MS = 300_000;
   const STREAM_REVENUE_TTL_MS = 900_000;
   const LIVER_GUILD_TTL_MS = 900_000;
+  const MORE_DATA_TTL_MS = 900_000;
+  const MAX_MORE_AMOUNT = 300_000_000;
   const REFRESH_COOLDOWN_MS = 60_000;
 
   function createGuardBroker({api, storageArea, now}) {
@@ -987,6 +1241,9 @@
       || !api?.fetchIpLocation
       || !api?.fetchStreamRevenue
       || !api?.fetchLiverGuild
+      || !api?.fetchLiverFlow
+      || !api?.fetchFansRank
+      || !api?.fetchRecentLive
     ) {
       throw new TypeError('Guard broker API is invalid');
     }
@@ -1107,6 +1364,159 @@
         await sessionCache.write(key, guild, LIVER_GUILD_TTL_MS);
         return guild;
       });
+    }
+
+    function emptyMoreFlow(status = 'unavailable') {
+      return {status, months: []};
+    }
+
+    function normalizeMoreFlow(value) {
+      const unavailable = emptyMoreFlow();
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return unavailable;
+      if (value.status === 'no_data') return emptyMoreFlow('no_data');
+      if (value.status !== 'found') return unavailable;
+      if (!Array.isArray(value.months) || value.months.length === 0 || value.months.length > 36) {
+        return unavailable;
+      }
+      const months = [];
+      for (const month of value.months) {
+        if (!month || typeof month !== 'object' || Array.isArray(month)) return unavailable;
+        if (
+          !Number.isSafeInteger(month.year)
+          || month.year < 2018
+          || month.year > 2100
+          || !Number.isSafeInteger(month.month)
+          || month.month < 1
+          || month.month > 12
+        ) return unavailable;
+        const amounts = [month.giftSc, month.guard, month.charge, month.total];
+        if (!amounts.every(amount => (
+          typeof amount === 'number' && Number.isFinite(amount) && amount >= 0 && amount <= MAX_MORE_AMOUNT
+        ))) return unavailable;
+        if (Math.abs((month.giftSc + month.guard + month.charge) - month.total) > 0.000001) {
+          return unavailable;
+        }
+        months.push({
+          year: month.year,
+          month: month.month,
+          giftSc: month.giftSc,
+          guard: month.guard,
+          charge: month.charge,
+          total: month.total,
+        });
+      }
+      return {status: 'found', months};
+    }
+
+    function emptyFansRank(status = 'unavailable') {
+      return {status, alive: null, groups: []};
+    }
+
+    function normalizeMoreFansRank(value) {
+      const unavailable = emptyFansRank();
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return unavailable;
+      if (value.status === 'no_data') return emptyFansRank('no_data');
+      if (value.status !== 'found') return unavailable;
+      if (!Number.isSafeInteger(value.alive) || value.alive <= 0 || value.alive > 100_000_000) {
+        return unavailable;
+      }
+      if (!Array.isArray(value.groups) || value.groups.length === 0 || value.groups.length > 8) {
+        return unavailable;
+      }
+      const groups = [];
+      for (const group of value.groups) {
+        if (!group || typeof group !== 'object' || Array.isArray(group)) return unavailable;
+        if (typeof group.name !== 'string' || !group.name.trim() || group.name.length > 40) {
+          return unavailable;
+        }
+        if (typeof group.medal !== 'string' || group.medal.length > 40) return unavailable;
+        if (!Number.isSafeInteger(group.count) || group.count < 0 || group.count > 100_000_000) {
+          return unavailable;
+        }
+        groups.push({
+          name: group.name.trim(),
+          medal: group.medal.trim(),
+          count: group.count,
+          self: group.self === true,
+        });
+      }
+      return {status: 'found', alive: value.alive, groups};
+    }
+
+    function emptyRecentLive(status = 'unavailable') {
+      return {
+        status,
+        liveId: null,
+        endedAt: null,
+        messages: null,
+        revenue: null,
+        peakOnline: null,
+        series: [],
+      };
+    }
+
+    function normalizeMoreRecentLive(value) {
+      const unavailable = emptyRecentLive();
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return unavailable;
+      if (value.status === 'no_data') return emptyRecentLive('no_data');
+      if (value.status !== 'found') return unavailable;
+      const {liveId, endedAt, messages, revenue, peakOnline, series} = value;
+      if (typeof liveId !== 'string' || !/^[1-9][0-9]{0,19}$/u.test(liveId)) return unavailable;
+      if (endedAt !== null && (
+        !Number.isSafeInteger(endedAt) || endedAt < 1_200_000_000 || endedAt > 4_200_000_000
+      )) return unavailable;
+      if (!Number.isSafeInteger(messages) || messages < 0 || messages > 100_000_000) {
+        return unavailable;
+      }
+      if (typeof revenue !== 'number' || !Number.isFinite(revenue) || revenue < 0 || revenue > 100_000_000) {
+        return unavailable;
+      }
+      if (peakOnline !== null && (
+        !Number.isSafeInteger(peakOnline) || peakOnline < 0 || peakOnline > 100_000_000
+      )) return unavailable;
+      if (!Array.isArray(series) || series.length > 120) return unavailable;
+      if (!series.every(point => (
+        Number.isSafeInteger(point) && point >= 0 && point <= 100_000_000
+      ))) return unavailable;
+      return {status: 'found', liveId, endedAt, messages, revenue, peakOnline, series: [...series]};
+    }
+
+    async function readMore(kind, uid, normalize, load) {
+      const key = `more:${kind}:${uid}`;
+      const cached = await sessionCache.read(key);
+      if (cached.state === 'fresh') return cached.value;
+      return coalesce(inFlight, `more-${kind}:${uid}`, async () => {
+        const shared = await sessionCache.read(key);
+        if (shared.state === 'fresh') return shared.value;
+        let value;
+        try {
+          value = normalize(await load());
+        } catch {
+          value = normalize(null);
+        }
+        await sessionCache.write(key, value, MORE_DATA_TTL_MS);
+        return value;
+      });
+    }
+
+    async function getMoreFlow(context) {
+      const uid = await identityUid(context);
+      return readMore('flow', uid, normalizeMoreFlow, () => api.fetchLiverFlow(uid));
+    }
+
+    async function getMoreFansRank(context) {
+      const uid = await identityUid(context);
+      return readMore('fans-rank', uid, normalizeMoreFansRank, () => api.fetchFansRank(uid));
+    }
+
+    async function getMoreRecentLive(context, roomId) {
+      const uid = await identityUid(context);
+      return readMore(
+        'recent-live',
+        `${uid}:${roomId}`,
+        normalizeMoreRecentLive,
+        () => api.fetchRecentLive(uid, roomId),
+      );
     }
 
     async function retryVerifiedStreamRevenue(context) {
@@ -1281,6 +1691,12 @@
         payload = await refresh(request);
       } else if (request.type === 'guard.stream-revenue.retry') {
         payload = await retryVerifiedStreamRevenue(request.context);
+      } else if (request.type === 'guard.more.flow.get') {
+        payload = {moreFlow: await getMoreFlow(request.context)};
+      } else if (request.type === 'guard.more.fans-rank.get') {
+        payload = {moreFansRank: await getMoreFansRank(request.context)};
+      } else if (request.type === 'guard.more.recent-live.get') {
+        payload = {moreRecentLive: await getMoreRecentLive(request.context, request.roomId)};
       } else {
         throw createError('invalid_identity');
       }
@@ -1819,6 +2235,233 @@
   opacity: 0.55;
 }
 
+.guard-more {
+  flex: 0 1 auto;
+  max-height: 60vh;
+  margin: 0 16px 10px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.guard-more[hidden] {
+  display: none;
+}
+
+.guard-more-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  color: #4b4f56;
+  background: #f7f8fa;
+  border: 1px solid #eef0f2;
+  border-radius: 11px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.guard-more-toggle:hover:not(:disabled) {
+  background: #f1f3f5;
+}
+
+.guard-more-toggle:focus-visible,
+.guard-more-card-head:focus-visible {
+  outline: 3px solid rgba(0, 174, 236, 0.28);
+  outline-offset: 2px;
+}
+
+.guard-more-toggle-label {
+  flex: 0 0 auto;
+}
+
+.guard-more-toggle-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #9499a0;
+  font-size: 11px;
+  font-weight: 400;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guard-more-chevron {
+  flex: 0 0 auto;
+  color: #9499a0;
+  font-size: 10px;
+  transition: transform 120ms ease;
+}
+
+.guard-more-toggle.is-open .guard-more-chevron,
+.guard-more-card-head.is-open .guard-more-chevron {
+  transform: rotate(180deg);
+}
+
+.guard-more-cards {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.guard-more-cards[hidden],
+.guard-more-card-body[hidden] {
+  display: none;
+}
+
+.guard-more-card {
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #eef0f2;
+  border-radius: 12px;
+}
+
+.guard-more-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 11px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.guard-more-card-head.is-open {
+  background: #fbfcfd;
+  border-bottom: 1px solid #eef0f2;
+}
+
+.guard-more-card-title {
+  flex: 1 1 auto;
+  color: #4b4f56;
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.guard-more-card-value {
+  flex: 0 0 auto;
+  color: #61666d;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.guard-more-card-value.is-unavailable,
+.guard-more-card-value.is-no-data {
+  color: #9499a0;
+}
+
+.guard-more-card-body {
+  padding: 10px 11px 12px;
+}
+
+.guard-more-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 46px;
+}
+
+.guard-more-bars i {
+  flex: 1 1 0;
+  min-height: 2px;
+  background: linear-gradient(180deg, #ffa8c2, #fb7299);
+  border-radius: 2px 2px 1px 1px;
+}
+
+.guard-more-bars i.is-online {
+  background: linear-gradient(180deg, #9fd8f5, #00aeec);
+}
+
+.guard-more-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 5px;
+  color: #9499a0;
+  font-size: 10px;
+}
+
+.guard-more-kpis {
+  display: flex;
+  gap: 14px;
+  margin-top: 8px;
+  color: #61666d;
+  font-size: 11px;
+}
+
+.guard-more-kpis b {
+  display: block;
+  color: #2f3138;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.guard-more-rank {
+  display: grid;
+  gap: 7px;
+}
+
+.guard-more-rank-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) 44px;
+  gap: 8px;
+  align-items: center;
+  color: #61666d;
+  font-size: 11.5px;
+}
+
+.guard-more-rank-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guard-more-rank-name.is-self {
+  color: #18191c;
+  font-weight: 700;
+}
+
+.guard-more-rank-medal {
+  margin-left: 4px;
+  color: #9499a0;
+  font-style: normal;
+}
+
+.guard-more-track {
+  height: 7px;
+  overflow: hidden;
+  background: #f1f2f3;
+  border-radius: 999px;
+}
+
+.guard-more-track i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #ffbfd2, #fb7299);
+  border-radius: 999px;
+}
+
+.guard-more-rank-count {
+  color: #2f3138;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.guard-more-note {
+  margin-top: 8px;
+  color: #9499a0;
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
 .guard-list {
   min-height: 0;
   flex: 1 1 auto;
@@ -1833,6 +2476,7 @@
 :host(.is-minimized) .guard-update,
 :host(.is-minimized) .guard-actions,
 :host(.is-minimized) .guard-anchor-sign,
+:host(.is-minimized) .guard-more,
 :host(.is-minimized) .guard-list,
 :host(.is-minimized) .guard-heading-group,
 :host(.is-minimized) .guard-count-wrap,
@@ -2167,6 +2811,7 @@
     onAnchorSign,
     onRevenueVerificationOpen,
     onRevenueVerificationRetry,
+    onMoreData,
     copy = value => copyText(document, viewport, value),
   }) {
     if (!document?.createElement || !viewport || typeof getURL !== 'function') {
@@ -2270,7 +2915,29 @@
     copyToast.setAttribute('role', 'status');
     copyToast.setAttribute('aria-live', 'polite');
 
-    section.append(header, status, update, actions, anchorSign, list, copyToast);
+    const more = document.createElement('div');
+    more.className = 'guard-more';
+    more.hidden = typeof onMoreData !== 'function';
+    const moreToggle = document.createElement('button');
+    moreToggle.className = 'guard-more-toggle';
+    moreToggle.type = 'button';
+    moreToggle.setAttribute('aria-expanded', 'false');
+    moreToggle.setAttribute('aria-label', '更多数据');
+    const moreToggleLabel = textElement(document, 'span', 'guard-more-toggle-label', '更多数据');
+    const moreToggleHint = textElement(
+      document,
+      'span',
+      'guard-more-toggle-hint',
+      '月度流水 · 粉丝牌 · 本场',
+    );
+    const moreToggleChevron = textElement(document, 'span', 'guard-more-chevron', '▾');
+    moreToggle.append(moreToggleLabel, moreToggleHint, moreToggleChevron);
+    const moreCards = document.createElement('div');
+    moreCards.className = 'guard-more-cards';
+    moreCards.hidden = true;
+    more.append(moreToggle, moreCards);
+
+    section.append(header, status, update, actions, anchorSign, more, list, copyToast);
     root.append(style, section);
     (document.documentElement ?? document.body).append(host);
 
@@ -2708,6 +3375,242 @@
       if (retryButton) retryButton.disabled = true;
     }
 
+    const moreCardState = new Map();
+    const MORE_CARD_TEXT = Object.freeze({
+      loading: '正在读取…',
+      no_data: '暂无数据',
+      unavailable: '暂不可用',
+    });
+
+    function formatMoreAmount(value) {
+      return Math.trunc(value).toLocaleString('zh-CN');
+    }
+
+    function monthLabel(year, month) {
+      return `${year}-${String(month).padStart(2, '0')}`;
+    }
+
+    function endedAtLabel(seconds) {
+      const date = new Date(seconds * 1000);
+      const pad = value => String(value).padStart(2, '0');
+      return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    }
+
+    function moreBars(document, values, {online = false} = {}) {
+      const wrap = document.createElement('div');
+      wrap.className = 'guard-more-bars';
+      const maximum = Math.max(...values, 1);
+      for (const value of values) {
+        const bar = document.createElement('i');
+        if (online) bar.className = 'is-online';
+        bar.style.height = `${Math.max(4, Math.round((value / maximum) * 100))}%`;
+        wrap.append(bar);
+      }
+      return wrap;
+    }
+
+    function moreKpis(document, entries) {
+      const wrap = document.createElement('div');
+      wrap.className = 'guard-more-kpis';
+      for (const [label, value] of entries) {
+        const item = document.createElement('span');
+        const number = textElement(document, 'b', '', value);
+        item.append(number, textElement(document, 'span', '', label));
+        wrap.append(item);
+      }
+      return wrap;
+    }
+
+    function setMoreCardStatus(state, text, className) {
+      state.value.textContent = text;
+      state.value.className = `guard-more-card-value${className ? ` ${className}` : ''}`;
+    }
+
+    function renderMoreFlow(state, value) {
+      const months = value.months;
+      const latest = months[months.length - 1];
+      const peak = months.reduce((best, month) => (month.total > best.total ? month : best), months[0]);
+      setMoreCardStatus(state, `本月 ${formatMoreAmount(latest.total)}`, '');
+      state.body.replaceChildren(
+        moreBars(document, months.map(month => month.total)),
+        (() => {
+          const axis = document.createElement('div');
+          axis.className = 'guard-more-axis';
+          const first = months[0];
+          axis.append(
+            textElement(document, 'span', '', monthLabel(first.year, first.month)),
+            textElement(document, 'span', '', monthLabel(latest.year, latest.month)),
+          );
+          return axis;
+        })(),
+        moreKpis(document, [
+          ['峰值月', `${formatMoreAmount(peak.total)}（${monthLabel(peak.year, peak.month)}）`],
+          ['本月', formatMoreAmount(latest.total)],
+        ]),
+      );
+    }
+
+    function renderMoreFansRank(state, value) {
+      setMoreCardStatus(state, `活跃 ${formatMoreAmount(value.alive)}`, '');
+      const rank = document.createElement('div');
+      rank.className = 'guard-more-rank';
+      const maximum = Math.max(...value.groups.map(group => group.count), 1);
+      for (const group of value.groups) {
+        const row = document.createElement('div');
+        row.className = 'guard-more-rank-row';
+        const name = textElement(
+          document,
+          'span',
+          `guard-more-rank-name${group.self ? ' is-self' : ''}`,
+          group.name,
+        );
+        name.setAttribute('title', group.name);
+        if (group.medal) {
+          name.append(textElement(document, 'em', 'guard-more-rank-medal', group.medal));
+        }
+        const track = document.createElement('span');
+        track.className = 'guard-more-track';
+        const fill = document.createElement('i');
+        fill.style.width = `${Math.max(4, Math.round((group.count / maximum) * 100))}%`;
+        track.append(fill);
+        row.append(
+          name,
+          track,
+          textElement(document, 'span', 'guard-more-rank-count', formatMoreAmount(group.count)),
+        );
+        rank.append(row);
+      }
+      state.body.replaceChildren(
+        rank,
+        textElement(document, 'div', 'guard-more-note', '粉丝牌名与同牌主播名来自 vtb.cat，仅显示文本。'),
+      );
+    }
+
+    function renderMoreRecentLive(state, value) {
+      const peakText = value.peakOnline === null ? '--' : formatMoreAmount(value.peakOnline);
+      setMoreCardStatus(state, `峰值 ${peakText}`, '');
+      const children = [];
+      if (value.series.length >= 2) {
+        children.push(moreBars(document, value.series, {online: true}));
+      }
+      const kpis = [['峰值同接', peakText], ['总弹幕', formatMoreAmount(value.messages)]];
+      kpis.push(['本场流水', formatMoreAmount(value.revenue)]);
+      if (value.endedAt !== null) kpis.push(['下播', endedAtLabel(value.endedAt)]);
+      children.push(moreKpis(document, kpis));
+      if (value.series.length < 2) {
+        children.push(textElement(document, 'div', 'guard-more-note', '分钟级同接数据暂不可用。'));
+      }
+      state.body.replaceChildren(...children);
+    }
+
+    function renderMoreCard(state, value) {
+      const status = value?.status;
+      if (status === 'loading') {
+        setMoreCardStatus(state, MORE_CARD_TEXT.loading, 'is-loading');
+        state.body.replaceChildren(
+          textElement(document, 'div', 'guard-more-note', MORE_CARD_TEXT.loading),
+        );
+        return;
+      }
+      if (status === 'found') {
+        if (state.kind === 'flow') renderMoreFlow(state, value);
+        else if (state.kind === 'fans-rank') renderMoreFansRank(state, value);
+        else renderMoreRecentLive(state, value);
+        return;
+      }
+      const text = status === 'no_data' ? MORE_CARD_TEXT.no_data : MORE_CARD_TEXT.unavailable;
+      setMoreCardStatus(state, text, status === 'no_data' ? 'is-no-data' : 'is-unavailable');
+      state.body.replaceChildren(textElement(document, 'div', 'guard-more-note', text));
+    }
+
+    function setMoreExpanded(expanded) {
+      const next = expanded === true;
+      moreToggle.setAttribute('aria-expanded', String(next));
+      moreToggle.classList.toggle('is-open', next);
+      moreCards.hidden = !next;
+      if (next) clampPositionAndNotify();
+    }
+
+    function setMoreCardOpen(state, open) {
+      state.open = open === true;
+      state.head.setAttribute('aria-expanded', String(state.open));
+      state.head.classList.toggle('is-open', state.open);
+      state.body.hidden = !state.open;
+      if (state.open && !state.requested) {
+        state.requested = true;
+        state.loaded = false;
+        renderMoreCard(state, {status: 'loading'});
+        Promise.resolve()
+          .then(() => onMoreData?.(state.kind))
+          .catch(() => {});
+      }
+      if (state.open) clampPositionAndNotify();
+    }
+
+    function toggleMoreCard(kind) {
+      const state = moreCardState.get(kind);
+      if (!state) return;
+      setMoreCardOpen(state, !state.open);
+    }
+
+    function createMoreCard(kind, title) {
+      const card = document.createElement('div');
+      card.className = 'guard-more-card';
+      const head = document.createElement('button');
+      head.className = 'guard-more-card-head';
+      head.type = 'button';
+      head.setAttribute('aria-expanded', 'false');
+      head.setAttribute('aria-label', title);
+      const value = textElement(document, 'span', 'guard-more-card-value', '');
+      head.append(
+        textElement(document, 'span', 'guard-more-card-title', title),
+        value,
+        textElement(document, 'span', 'guard-more-chevron', '▾'),
+      );
+      const body = document.createElement('div');
+      body.className = 'guard-more-card-body';
+      body.hidden = true;
+      card.append(head, body);
+      head.addEventListener('click', () => toggleMoreCard(kind));
+      moreCards.append(card);
+      const state = {
+        kind, card, head, value, body, open: false, requested: false, loaded: false,
+      };
+      moreCardState.set(kind, state);
+      return state;
+    }
+
+    function resetMore() {
+      if (typeof onMoreData !== 'function') return;
+      setMoreExpanded(false);
+      for (const state of moreCardState.values()) {
+        state.open = false;
+        state.requested = false;
+        state.loaded = false;
+        state.head.setAttribute('aria-expanded', 'false');
+        state.head.classList.remove('is-open');
+        state.body.hidden = true;
+        state.body.replaceChildren();
+        setMoreCardStatus(state, '', '');
+      }
+    }
+
+    function renderMoreData(kind, value) {
+      if (destroyed) return;
+      const state = moreCardState.get(kind);
+      if (!state) return;
+      state.loaded = true;
+      renderMoreCard(state, value);
+      clampPositionAndNotify();
+    }
+
+    moreToggle.addEventListener('click', () => setMoreExpanded(moreCards.hidden));
+    if (typeof onMoreData === 'function') {
+      createMoreCard('flow', '月度流水');
+      createMoreCard('fans-rank', '粉丝牌成分');
+      createMoreCard('recent-live', '最近一场');
+    }
+
     function resetCreator() {
       clearCreatorAvatar();
       clearCreatorLocation();
@@ -2722,6 +3625,7 @@
       count.textContent = '--';
       list.replaceChildren();
       clearAnchorSign();
+      resetMore();
     }
 
     function renderLoading() {
@@ -2914,6 +3818,7 @@
       renderNavigationLoading,
       renderSummary,
       renderStreamRevenue,
+      renderMoreData,
       renderRevenueVerificationLoading,
       renderDetails,
       renderError,
@@ -3035,6 +3940,95 @@
     return {status: 'unavailable', name: ''};
   }
 
+  function boundedRemoteText(value, maximum) {
+    if (typeof value !== 'string' || /[<>]/u.test(value)) return '';
+    const text = value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim();
+    return text ? text.slice(0, maximum) : '';
+  }
+
+  function boundedAmount(value, maximum = 300_000_000) {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= maximum
+      ? value
+      : null;
+  }
+
+  function normalizeMoreFlow(value) {
+    const unavailable = {status: 'unavailable', months: []};
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return unavailable;
+    if (value.status === 'no_data') return {status: 'no_data', months: []};
+    if (value.status !== 'found' || !Array.isArray(value.months)) return unavailable;
+    if (value.months.length === 0 || value.months.length > 36) return unavailable;
+    const months = [];
+    for (const month of value.months) {
+      if (!month || typeof month !== 'object' || Array.isArray(month)) return unavailable;
+      const year = normalizePositiveInteger(month.year);
+      const monthNumber = normalizePositiveInteger(month.month);
+      const giftSc = boundedAmount(month.giftSc);
+      const guard = boundedAmount(month.guard);
+      const charge = boundedAmount(month.charge);
+      const total = boundedAmount(month.total);
+      if (!year || !monthNumber || monthNumber > 12) return unavailable;
+      if (giftSc === null || guard === null || charge === null || total === null) return unavailable;
+      if (Math.abs((giftSc + guard + charge) - total) > 0.000001) return unavailable;
+      months.push({year, month: monthNumber, giftSc, guard, charge, total});
+    }
+    return {status: 'found', months};
+  }
+
+  function normalizeMoreFansRank(value) {
+    const unavailable = {status: 'unavailable', alive: null, groups: []};
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return unavailable;
+    if (value.status === 'no_data') return {status: 'no_data', alive: 0, groups: []};
+    if (value.status !== 'found') return unavailable;
+    const alive = normalizePositiveInteger(value.alive);
+    if (
+      !alive
+      || !Array.isArray(value.groups)
+      || value.groups.length === 0
+      || value.groups.length > 8
+    ) return unavailable;
+    const groups = [];
+    for (const group of value.groups) {
+      if (!group || typeof group !== 'object' || Array.isArray(group)) return unavailable;
+      const name = boundedRemoteText(group.name, 40);
+      if (!name) return unavailable;
+      const medal = boundedRemoteText(group.medal, 40);
+      const count = normalizePositiveInteger(group.count, {allowZero: true});
+      if (count === null) return unavailable;
+      groups.push({name, medal, count, self: group.self === true});
+    }
+    return {status: 'found', alive, groups};
+  }
+
+  function normalizeMoreRecentLive(value) {
+    const unavailable = {
+      status: 'unavailable',
+      liveId: null,
+      endedAt: null,
+      messages: null,
+      revenue: null,
+      peakOnline: null,
+      series: [],
+    };
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return unavailable;
+    if (value.status === 'no_data') return {...unavailable, status: 'no_data'};
+    if (value.status !== 'found') return unavailable;
+    const liveId = normalizeUid(value.liveId);
+    const endedAt = value.endedAt === null ? null : normalizePositiveInteger(value.endedAt);
+    const messages = normalizePositiveInteger(value.messages, {allowZero: true});
+    const revenue = boundedAmount(value.revenue, 100_000_000);
+    const peakOnline = value.peakOnline === null
+      ? null
+      : normalizePositiveInteger(value.peakOnline, {allowZero: true});
+    if (!liveId || messages === null || revenue === null) return unavailable;
+    if (value.endedAt !== null && endedAt === null) return unavailable;
+    if (value.peakOnline !== null && peakOnline === null) return unavailable;
+    if (!Array.isArray(value.series) || value.series.length > 120) return unavailable;
+    const series = value.series.map(point => normalizePositiveInteger(point, {allowZero: true}));
+    if (series.some(point => point === null)) return unavailable;
+    return {status: 'found', liveId, endedAt, messages, revenue, peakOnline, series};
+  }
+
   function normalizeSummary(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw createError('guard_lookup_failed');
@@ -3136,6 +4130,7 @@
     let currentContext = null;
     let currentKey = null;
     let currentCreatorUid = null;
+    let currentCreatorRoomId = null;
     let generation = 0;
     let panel = null;
     let stopWatching = null;
@@ -3213,6 +4208,7 @@
         if (response.summary) {
           const summary = normalizeSummary(response.summary);
           currentCreatorUid = summary.creator.uid;
+          currentCreatorRoomId = summary.creator.roomId;
           panel.renderSummary(summary);
           if (autoDetailsPendingGeneration === expectedGeneration) {
             autoDetailsPendingGeneration = null;
@@ -3225,6 +4221,7 @@
         if (response.details) {
           const details = normalizeDetails(response.details);
           currentCreatorUid = details.creator.uid;
+          currentCreatorRoomId = details.creator.roomId;
           panel.renderDetails(details);
         }
         if (response.streamRevenue) {
@@ -3291,6 +4288,64 @@
       return request('guard.stream-revenue.retry');
     }
 
+    const MORE_REQUESTS = Object.freeze({
+      flow: {type: 'guard.more.flow.get', key: 'moreFlow', normalize: normalizeMoreFlow},
+      'fans-rank': {
+        type: 'guard.more.fans-rank.get', key: 'moreFansRank', normalize: normalizeMoreFansRank,
+      },
+      'recent-live': {
+        type: 'guard.more.recent-live.get', key: 'moreRecentLive', normalize: normalizeMoreRecentLive,
+      },
+    });
+
+    async function requestMore(kind) {
+      const spec = MORE_REQUESTS[kind];
+      if (!spec || !currentCreatorUid || !panel || destroyed) return null;
+      if (kind === 'recent-live' && !currentCreatorRoomId) {
+        panel.renderMoreData?.(kind, spec.normalize(null));
+        return null;
+      }
+      const expectedGeneration = generation;
+      const requestId = randomId();
+      const message = {
+        type: spec.type,
+        requestId,
+        pageGeneration: expectedGeneration,
+        context: activeContext(),
+        force: false,
+      };
+      if (kind === 'recent-live') message.roomId = currentCreatorRoomId;
+      let response;
+      try {
+        response = await sendMessage(message);
+      } catch {
+        if (!destroyed && expectedGeneration === generation) {
+          panel?.renderMoreData?.(kind, spec.normalize(null));
+        }
+        return null;
+      }
+      if (
+        destroyed
+        || expectedGeneration !== generation
+        || !panel
+        || !response
+        || response.requestId !== requestId
+        || response.pageGeneration !== expectedGeneration
+      ) {
+        return null;
+      }
+      if (response.ok !== true) {
+        panel.renderMoreData?.(kind, spec.normalize(null));
+        return response;
+      }
+      panel.renderMoreData?.(kind, spec.normalize(response[spec.key]));
+      return response;
+    }
+
+    async function onMoreData(kind) {
+      return requestMore(kind);
+    }
+
     async function persistUiState(patch) {
       uiState = {...uiState, ...patch, version: 1};
       const saved = await saveUiState(uiState);
@@ -3334,6 +4389,7 @@
         onRevenueVerificationRetry: typeof openRevenueVerification === 'function'
           ? onRevenueVerificationRetry
           : null,
+        onMoreData,
       });
       if (!updateStatusRequested) {
         updateStatusRequested = true;
@@ -3352,6 +4408,7 @@
       currentContext = context;
       currentKey = nextKey;
       currentCreatorUid = null;
+      currentCreatorRoomId = null;
       detailsOpen = false;
 
       if (!context) {
@@ -3414,6 +4471,9 @@
     normalizeIpLocation,
     normalizeSummary,
     normalizeDetails,
+    normalizeMoreFlow,
+    normalizeMoreFansRank,
+    normalizeMoreRecentLive,
   });
 
   if (globalThis.chrome?.runtime?.sendMessage && globalThis.document && runtime.panelView) {
@@ -3462,6 +4522,26 @@
 
   const LIVER_GUILD_PATH_PREFIX = '/https:' + '//' + 'workers.vrp.moe/laplace/bilibili-user/';
 
+  const VTB_PATH_PARAMS = Object.freeze({
+    '/liver/space': ['uid'],
+    '/liver/flow': ['uid'],
+    '/fansRank': ['liver'],
+    '/actions': ['uid', 'room', 'pn', 'ps', 'order'],
+    '/online': ['id'],
+  });
+
+  function isAllowedVtbRequest(url) {
+    const allowed = VTB_PATH_PARAMS[url.pathname];
+    if (!allowed || url.hash !== '') return false;
+    const seen = new Set();
+    for (const [key, value] of url.searchParams) {
+      if (!allowed.includes(key) || seen.has(key)) return false;
+      seen.add(key);
+      if (!/^[A-Za-z0-9_]{1,40}$/u.test(value)) return false;
+    }
+    return true;
+  }
+
   function parseHeaders(raw) {
     const values = new Map();
     if (typeof raw === 'string') {
@@ -3501,7 +4581,7 @@
         return url.pathname === '/bw/api/public/bilibili/ip-location';
       }
       if (url.hostname === 'api.vtb.cat') {
-        return url.pathname === '/liver/space';
+        return isAllowedVtbRequest(url);
       }
       if (url.hostname === 'fetch.danmakus.com') {
         const uid = url.pathname.startsWith(LIVER_GUILD_PATH_PREFIX)
@@ -4293,7 +5373,7 @@
       getResourceUrl: globalThis.GM_getResourceURL,
       registerMenuCommand: globalThis.GM_registerMenuCommand,
       openInTab: globalThis.GM_openInTab,
-      currentVersion: '0.3.1.30',
+      currentVersion: '0.3.1.31',
       location: globalThis.location,
       document: globalThis.document,
       addEventListener: globalThis.addEventListener.bind(globalThis),
