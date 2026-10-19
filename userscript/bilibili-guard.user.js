@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站大航海详情
 // @namespace    https://github.com/EchoXiaoze/bilibili-guard-extension
-// @version      0.3.1.29
+// @version      0.3.1.30
 // @description  在B站视频页和个人空间按需显示当前创作者的大航海详情。
 // @match        https://www.bilibili.com/video/*
 // @match        https://space.bilibili.com/*
@@ -558,7 +558,7 @@
   const MAX_BODY_BYTES = 2 * 1024 * 1024;
   const MAX_IP_LOCATION_BODY_BYTES = 16 * 1024;
   const IP_LOCATION_TIMEOUT_MS = 2500;
-  const MAX_STREAM_REVENUE_BODY_BYTES = 512 * 1024;
+  const MAX_STREAM_REVENUE_BODY_BYTES = 2 * 1024 * 1024;
   const STREAM_REVENUE_TIMEOUT_MS = 4000;
   const MAX_STREAM_REVENUE = 100_000_000;
   const MAX_LIVER_GUILD_BODY_BYTES = 64 * 1024;
@@ -601,12 +601,16 @@
 
   function parseCharge(value) {
     let charges = value;
+    if (charges === null || charges === undefined) return 0;
     if (typeof charges === 'string') {
+      const text = charges.trim();
+      if (text === '' || text === 'null') return 0;
       try {
-        charges = JSON.parse(charges);
+        charges = JSON.parse(text);
       } catch {
         return null;
       }
+      if (charges === null) return 0;
     }
     if (!Array.isArray(charges) || charges.length > 1000) return null;
     let total = 0;
@@ -2139,7 +2143,8 @@
       const pathname = transformIndex === -1
         ? url.pathname
         : url.pathname.slice(0, transformIndex);
-      if (!pathname.startsWith('/bfs/face/') || !/\.(?:jpe?g|png)$/iu.test(pathname)) return null;
+      const approvedAvatarPath = pathname.startsWith('/bfs/face/') || pathname.startsWith('/bfs/garb/');
+      if (!approvedAvatarPath || !/\.(?:jpe?g|png)$/iu.test(pathname)) return null;
       url.pathname = pathname;
       url.search = '';
       url.hash = '';
@@ -3881,7 +3886,7 @@
   const CACHE_VERSION = 2;
   const TTL_MS = 900_000;
   const REQUEST_TIMEOUT_MS = 4000;
-  const MAX_BODY_BYTES = 512 * 1024;
+  const MAX_BODY_BYTES = 2 * 1024 * 1024;
   const MAX_REVENUE = 100_000_000;
 
   function requestFailed() {
@@ -3981,12 +3986,16 @@
 
   function chargeTotal(value) {
     let charges = value;
+    if (charges === null || charges === undefined) return 0;
     if (typeof charges === 'string') {
+      const text = charges.trim();
+      if (text === '' || text === 'null') return 0;
       try {
-        charges = JSON.parse(charges);
+        charges = JSON.parse(text);
       } catch {
         return null;
       }
+      if (charges === null) return 0;
     }
     if (!Array.isArray(charges) || charges.length > 1000) return null;
     let total = 0;
@@ -4284,7 +4293,7 @@
       getResourceUrl: globalThis.GM_getResourceURL,
       registerMenuCommand: globalThis.GM_registerMenuCommand,
       openInTab: globalThis.GM_openInTab,
-      currentVersion: '0.3.1.29',
+      currentVersion: '0.3.1.30',
       location: globalThis.location,
       document: globalThis.document,
       addEventListener: globalThis.addEventListener.bind(globalThis),
